@@ -1344,14 +1344,6 @@ fn test_cancel_wrong_employer_panics() {
     assert!(result.is_err());
 }
 
-// #[test]
-// fn test_cancel_already_canceled_is_idempotent() {
-//     let env = Env::default();
-//     env.mock_all_auths();
-//     let (client, employer, worker, token, _) = setup(&env);
-//     env.ledger().with_mut(|li| {
-//         li.timestamp = 0;
-//     });
 //     let stream_id = client.create_stream(
 //         &employer, &worker, &token, &100, &0u64, &0u64, &100u64, &None,
 //     );
