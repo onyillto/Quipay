@@ -36,6 +36,7 @@ pub enum DataKey {
     EmployerStreamLimit(Address), // Per-employer maximum active stream override
     MinStreamDuration,       // Configurable minimum stream duration in seconds
     Receipt,                 // PayrollReceipt contract address (optional)
+    FeeRecipient,            // Address to send protocol fees
 }
 
 #[contracttype]
@@ -229,6 +230,7 @@ const MAX_EARLY_CANCEL_FEE_BPS: u32 = 1000;
 const UPGRADE_PROPOSED: soroban_sdk::Symbol = soroban_sdk::symbol_short!("up_prop");
 const UPGRADE_EXECUTED: soroban_sdk::Symbol = soroban_sdk::symbol_short!("up_exec");
 const UPGRADE_CANCELED: soroban_sdk::Symbol = soroban_sdk::symbol_short!("up_cancel");
+const FEE_RECIPIENT_UPDATED: soroban_sdk::Symbol = soroban_sdk::symbol_short!("fee_rec_upd");
 
 #[contract]
 pub struct PayrollStream;
@@ -246,6 +248,7 @@ impl PayrollStream {
         env.storage()
             .instance()
             .set(&DataKey::RetentionSecs, &DEFAULT_RETENTION_SECS);
+        env.storage().instance().set(&DataKey::FeeRecipient, &admin);
         Ok(())
     }
 
@@ -400,6 +403,35 @@ impl PayrollStream {
             .unwrap_or(DEFAULT_MIN_STREAM_DURATION)
     }
  
+    /// Set the address that receives protocol fees (e.g., early cancellation fees).
+    /// Only admin can call this function.
+    pub fn set_fee_recipient(env: Env, new_address: Address) -> Result<(), QuipayError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(QuipayError::NotInitialized)?;
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeRecipient, &new_address);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "admin"),
+                FEE_RECIPIENT_UPDATED,
+                admin,
+            ),
+            new_address,
+        );
+        Ok(())
+    }
+
+    /// Get the currently configured address for receiving protocol fees.
+    pub fn get_fee_recipient(env: Env) -> Result<Address, QuipayError> {
+        env.storage().instance().get(&DataKey::FeeRecipient).ok_or(QuipayError::NotInitialized)
+    }
     /// Set the global default maximum number of active streams per employer.
     /// Only admin can call this function.
     pub fn set_max_streams_per_employer(env: Env, limit: u32) -> Result<(), QuipayError> {
@@ -589,124 +621,75 @@ impl PayrollStream {
         Ok(stream_id)
     }
 
-    /// Creates multiple streams atomically and optionally deposits a lump sum into the vault.
-    /// This is significantly more gas-efficient than calling create_stream individually
-    /// as it groups vault interactions into single calls.
-    pub fn create_stream_batch(
+    pub fn batch_create_streams(
         env: Env,
         params: Vec<StreamParams>,
-        vault_deposit: i128,
-    ) -> Result<Vec<u64>, QuipayError> {
+    ) -> Result<Vec<u32>, QuipayError> {
         Self::require_not_paused(&env)?;
 
         if params.len() > MAX_BATCH_CREATE_STREAMS {
             return Err(QuipayError::BatchTooLarge);
         }
+
         if params.is_empty() {
             return Ok(Vec::new(&env));
         }
 
-        // All streams in a batch must share the same employer and token for atomic funding
         let first_param = params.get(0).ok_or(QuipayError::InvalidAmount)?;
         let authorized_employer = first_param.employer.clone();
-        let token = first_param.token.clone();
         authorized_employer.require_auth();
 
-        let vault: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Vault)
-            .ok_or(QuipayError::NotInitialized)?;
+        let mut stream_ids = Vec::new(&env);
+        let mut index = 0u32;
 
-        let mut total_liability: i128 = 0;
-        let mut validated_params = Vec::new(&env);
-
-        // Phase 1: Pre-validation and liability calculation
-        for param in params.iter() {
-            if param.employer != authorized_employer || param.token != token {
-                return Err(QuipayError::Custom); // Batch must be homogeneous (same employer/token)
-            }
-            
-            if param.rate <= 0 || param.end_ts <= param.start_ts {
-                return Err(QuipayError::InvalidAmount);
-            }
-
-            let duration = param.end_ts.saturating_sub(param.start_ts);
-            let stream_total = param.rate
-                .checked_mul(i128::from(duration as i64))
-                .ok_or(QuipayError::Overflow)?;
-            
-            total_liability = total_liability.checked_add(stream_total).ok_or(QuipayError::Overflow)?;
-            validated_params.push_back(param);
-        }
-
-        // Phase 2: Atomic Vault Interaction
-        if vault_deposit > 0 {
-            // Optionally fund the treasury first
-            env.invoke_contract::<()>(
-                &vault,
-                &Symbol::new(&env, "deposit"),
-                soroban_sdk::vec![&env, authorized_employer.into_val(&env), token.into_val(&env), vault_deposit.into_val(&env)],
-            );
-        }
-
-        // Single solvency check for the entire batch
-        let solvent: bool = env.invoke_contract(
-            &vault,
-            &Symbol::new(&env, "check_solvency"),
-            soroban_sdk::vec![&env, token.clone().into_val(&env), total_liability.into_val(&env)],
-        );
-        require!(solvent, QuipayError::InsufficientBalance);
-
-        // Single liability update
-        env.invoke_contract::<()>(
-            &vault,
-            &Symbol::new(&env, "add_liability"),
-            soroban_sdk::vec![&env, token.clone().into_val(&env), total_liability.into_val(&env)],
-        );
-
-        // Phase 3: Record Creation
-        let mut next_id: u64 = env.storage().instance().get(&DataKey::NextStreamId).unwrap_or(1);
-        let mut created_ids = Vec::new(&env);
-        let now = env.ledger().timestamp();
-
-        for param in validated_params.iter() {
-            let stream_id = next_id;
-            next_id += 1;
-
-            let stream = Stream {
-                employer: authorized_employer.clone(),
-                worker: param.worker.clone(),
-                token: token.clone(),
-                rate: param.rate,
-                cliff_ts: if param.cliff_ts <= param.start_ts { param.start_ts } else { param.cliff_ts },
-                start_ts: param.start_ts,
-                end_ts: param.end_ts,
-                total_amount: param.rate.checked_mul(i128::from((param.end_ts - param.start_ts) as i64)).unwrap(),
-                withdrawn_amount: 0,
-                last_withdrawal_ts: 0,
-                status: StreamStatus::Active,
-                created_at: now,
-                closed_at: 0,
-                paused_at: 0,
-                total_paused_duration: 0,
-                metadata_hash: param.metadata_hash.clone(),
-                cancel_effective_at: 0,
-                speed_curve: match param.speed_curve { MaybeSpeedCurve::Some(c) => c, _ => stream_curve::SpeedCurve::Linear },
+        while index < params.len() {
+            let Some(param) = params.get(index) else {
+                index += 1;
+                continue;
             };
 
-            env.storage().persistent().set(&StreamKey::Stream(stream_id), &stream);
-            created_ids.push_back(stream_id);
-            
-            // Emit individual events for downstream indexers
+            if param.employer != authorized_employer {
+                return Err(QuipayError::Unauthorized);
+            }
+
+            let stream_id = Self::create_stream_internal(
+                env.clone(),
+                param.employer.clone(),
+                param.worker.clone(),
+                param.token.clone(),
+                param.rate,
+                param.cliff_ts,
+                param.start_ts,
+                param.end_ts,
+                param.metadata_hash.clone(),
+                match param.speed_curve {
+                    MaybeSpeedCurve::Some(c) => Some(c),
+                    MaybeSpeedCurve::None => None,
+                },
+            )?;
+
             env.events().publish(
-                (Symbol::new(&env, "stream"), Symbol::new(&env, "created"), param.worker.clone(), authorized_employer.clone()),
-                (stream_id, token.clone(), param.rate, param.start_ts, param.end_ts),
+                (
+                    Symbol::new(&env, "stream"),
+                    Symbol::new(&env, "created"),
+                    param.worker,
+                    param.employer,
+                ),
+                (
+                    stream_id,
+                    param.token,
+                    param.rate,
+                    param.start_ts,
+                    param.end_ts,
+                ),
             );
+
+            let stream_id = u32::try_from(stream_id).map_err(|_| QuipayError::Overflow)?;
+            stream_ids.push_back(stream_id);
+            index += 1;
         }
 
-        env.storage().instance().set(&DataKey::NextStreamId, &next_id);
-        Ok(created_ids)
+        Ok(stream_ids)
     }
 
     /// Withdraw vested funds from a stream.
@@ -1523,6 +1506,7 @@ impl PayrollStream {
             .ok_or(QuipayError::Overflow)?;
 
         let cancel_fee = Self::calculate_early_cancel_fee(env, remaining_liability);
+        let fee_recipient = Self::get_fee_recipient(env.clone())?; // Get the configured fee recipient
 
         if remaining_liability > 0 {
             Self::call_vault_remove_liability(
@@ -1536,7 +1520,7 @@ impl PayrollStream {
                 Self::call_vault_payout(
                     env,
                     &vault,
-                    stream.worker.clone(),
+                    fee_recipient.clone(), // Send fee to the configured recipient
                     stream.token.clone(),
                     cancel_fee,
                 );
@@ -1687,7 +1671,8 @@ impl PayrollStream {
         Ok(stream_id)
     }
 
-
+    /// Cancel a stream via an authorized AutomationGateway on behalf of an employer.
+    /// Only the registered gateway can call this method.
     pub fn cancel_stream_via_gateway(
         env: Env,
         stream_id: u64,
@@ -2443,7 +2428,7 @@ impl PayrollStream {
         };
         // ClosureReason enum discriminant is passed as u32 to avoid a cross-crate
         // contracttype dependency at the call site.
-        let _ = env.try_invoke_contract::<u64, soroban_sdk::Error>(
+        let _ = env.try_invoke_contract::<u64, ()>(
             &receipt_addr,
             &Symbol::new(env, "mint"),
             vec![
@@ -2461,10 +2446,2119 @@ impl PayrollStream {
         );
     }
 
-    /// Calculate the vested amount at a specific timestamp, accounting for pauses.
+    pub(crate) fn vested_amount_at(stream: &Stream, timestamp: u64) -> i128 {
+        let is_closed = Self::is_closed(stream);
+        let mut effective_ts = if is_closed {
+            core::cmp::min(timestamp, stream.closed_at)
+        } else {
+            timestamp
+        };
+
+        // Adjust effective_ts for currently paused streams
+        if stream.status == StreamStatus::Paused {
+            effective_ts = core::cmp::min(effective_ts, stream.paused_at);
+        }
+
+        // Cap vesting at cancel_effective_at when a grace period is pending
+        if !is_closed && stream.cancel_effective_at > 0 {
+            effective_ts = core::cmp::min(effective_ts, stream.cancel_effective_at);
+        }
+
+        // Subtract total paused duration from the elapsed time
+        let elapsed_reduction = stream.total_paused_duration;
+
+        if effective_ts < stream.cliff_ts {
+            return 0;
+        }
+
+        let start_with_pauses = stream.start_ts.saturating_add(elapsed_reduction);
+
+        if effective_ts <= start_with_pauses {
+            if effective_ts == start_with_pauses && stream.end_ts == stream.start_ts {
+                return stream.total_amount;
+            }
+            return 0;
+        }
+
+        let end_with_pauses = stream.end_ts.saturating_add(elapsed_reduction);
+
+        if effective_ts >= end_with_pauses
+            || (stream.status == StreamStatus::Completed && effective_ts >= stream.closed_at)
+        {
+            return stream.total_amount;
+        }
+
+        let elapsed: u64 = effective_ts.saturating_sub(start_with_pauses);
+        let duration: u64 = stream.end_ts.saturating_sub(stream.start_ts);
+        if duration == 0 {
+            return stream.total_amount;
+        }
+
+        // Delegate to the curve module — all three curves share the same
+        // boundary guarantees and integer-safe implementation.
+        stream_curve::compute_vested(elapsed, duration, stream.total_amount, stream.speed_curve)
+    }
+
+    pub fn raise_dispute(
+        env: Env,
+        stream_id: u64,
+        caller: Address,
+        reason_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), QuipayError> {
+        Self::require_not_paused(&env)?;
+        dispute::raise_dispute(&env, stream_id, &caller, reason_hash)
+    }
+
+    pub fn resolve_dispute(
+        env: Env,
+        stream_id: u64,
+        arbitrator: Address,
+        outcome: DisputeOutcome,
+    ) -> Result<(), QuipayError> {
+        Self::require_not_paused(&env)?;
+        dispute::resolve_dispute(&env, stream_id, &arbitrator, outcome)
+    }
+
+    pub fn get_dispute(env: Env, stream_id: u64) -> Option<dispute::Dispute> {
+        dispute::get_dispute(&env, stream_id)
+    }
+
+    pub fn has_open_dispute(env: Env, stream_id: u64) -> bool {
+        dispute::has_open_dispute(&env, stream_id)
+    }
+}
+
+mod dispute;
+mod extension_test;
+mod pause_test;
+mod stream_extension;
+mod stream_pause;
+
+mod stream_curve;
+mod test;
+
+#[cfg(test)]
+mod duration_test;
+
+#[cfg(test)]
+mod batch_cancel_test;
+
+#[cfg(test)]
+mod batch_claim_test;
+
+#[cfg(test)]
+mod cancel_grace_test;
+
+#[cfg(test)]
+mod integration_test;
+
+#[cfg(test)]
+mod proptest;
+
+#[cfg(test)]
+mod withdraw_proptest;
+mod upgrade_migration_test;
+#[cfg(test)]
+mod fee_recipient_test;
+            .ok_or(QuipayError::Overflow)?;
+
+        let cancel_fee = Self::calculate_early_cancel_fee(env, remaining_liability);
+
+        if remaining_liability > 0 {
+            Self::call_vault_remove_liability(
+                env,
+                &vault,
+                stream.token.clone(),
+                remaining_liability,
+            );
+
+            if cancel_fee > 0 {
+                Self::call_vault_payout(
+                    env,
+                    &vault,
+                    stream.worker.clone(),
+                    stream.token.clone(),
+                    cancel_fee,
+                );
+            }
+        }
+
+        Self::close_stream_internal(stream, now, StreamStatus::Canceled);
+        env.storage().persistent().set(key, stream);
+
+        env.events().publish(
+            (
+                soroban_sdk::Symbol::new(env, "stream"),
+                soroban_sdk::Symbol::new(env, "canceled"),
+                stream_id,
+                stream.employer.clone(),
+            ),
+            (stream.worker.clone(), stream.token.clone()),
+        );
+
+        Self::try_mint_receipt(env, stream, stream_id, 1u32); // 1 = Cancelled
+
+        stream.status = StreamStatus::Canceled;
+        stream.closed_at = now;
+
+        Ok(())
+    }
+
+    /// Set the authorized AutomationGateway contract address.
+    /// Only the admin can call this.
+    pub fn set_gateway(env: Env, gateway: Address) -> Result<(), QuipayError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(QuipayError::NotInitialized)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Gateway, &gateway);
+        Ok(())
+    }
+
+    /// Get the authorized AutomationGateway contract address.
+    pub fn get_gateway(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Gateway)
+    }
+
+    /// Create a stream via an authorized AutomationGateway on behalf of an employer.
+    /// Only the registered gateway can call this method.
+    pub fn create_stream_via_gateway(
+        env: Env,
+        employer: Address,
+        worker: Address,
+        token: Address,
+        rate: i128,
+        cliff_ts: u64,
+        start_ts: u64,
+        end_ts: u64,
+        metadata_hash: Option<BytesN<32>>,
+    ) -> Result<u64, QuipayError> {
+        Self::require_not_paused(&env)?;
+
+        // Verify the caller is the authorized gateway
+        let gateway: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Gateway)
+            .ok_or(QuipayError::NotInitialized)?;
+        gateway.require_auth();
+
+        // Call the internal create stream logic
+        Self::create_stream_internal(
+            env,
+            employer,
+            worker,
+            token,
+            rate,
+            cliff_ts,
+            start_ts,
+            end_ts,
+            metadata_hash,
+            core::option::Option::<stream_curve::SpeedCurve>::None, // speed_curve not supported via gateway yet
+        )
+    }
+
+    /// Set the authorized DAO governance contract address.
+    /// Only admin can call this.
+    pub fn set_dao_governance(env: Env, dao: Address) -> Result<(), QuipayError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(QuipayError::NotInitialized)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::DaoGovernance, &dao);
+        Ok(())
+    }
+
+    /// Get the authorized DAO governance contract address.
+    pub fn get_dao_governance(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::DaoGovernance)
+    }
+
+    /// Create a stream via an executed DAO governance proposal.
+    /// Only the registered DaoGovernance contract can call this method.
+    pub fn create_stream_via_governance(
+        env: Env,
+        employer: Address,
+        worker: Address,
+        token: Address,
+        rate: i128,
+        cliff_ts: u64,
+        start_ts: u64,
+        end_ts: u64,
+        metadata_hash: Option<BytesN<32>>,
+    ) -> Result<u64, QuipayError> {
+        Self::require_not_paused(&env)?;
+
+        // Verify the caller is the authorized DAO governance contract
+        let dao: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::DaoGovernance)
+            .ok_or(QuipayError::NotInitialized)?;
+        dao.require_auth();
+
+        let stream_id = Self::create_stream_internal(
+            env.clone(),
+            employer.clone(),
+            worker.clone(),
+            token.clone(),
+            rate,
+            cliff_ts,
+            start_ts,
+            end_ts,
+            metadata_hash,
+            core::option::Option::<stream_curve::SpeedCurve>::None,
+        )?;
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "stream"),
+                Symbol::new(&env, "created_via_governance"),
+                worker,
+                employer,
+            ),
+            (stream_id, token, rate, start_ts, end_ts),
+        );
+
+        Ok(stream_id)
+    }
+
+    /// Cancel a stream via an authorized AutomationGateway on behalf of an employer.
+    /// Only the registered gateway can call this method.
+    pub fn cancel_stream_via_gateway(
+        env: Env,
+        stream_id: u64,
+        employer: Address,
+    ) -> Result<(), QuipayError> {
+        Self::require_not_paused(&env)?;
+
+        // Verify the caller is the authorized gateway
+        let gateway: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Gateway)
+            .ok_or(QuipayError::NotInitialized)?;
+        gateway.require_auth();
+
+        let key = StreamKey::Stream(stream_id);
+        let mut stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(QuipayError::StreamNotFound)?;
+
+        if stream.employer != employer {
+            return Err(QuipayError::NotEmployer);
+        }
+        if Self::is_closed(&stream) {
+            return Ok(());
+        }
+
+        let now = env.ledger().timestamp();
+
+        // If a grace period is already active, reject duplicate request.
+        if stream.cancel_effective_at > 0 && now < stream.cancel_effective_at {
+            return Err(QuipayError::GracePeriodActive);
+        }
+
+        // If the grace period has elapsed, finalize now.
+        if stream.cancel_effective_at > 0 && now >= stream.cancel_effective_at {
+            return Self::finalize_cancel(&env, stream_id, &key, &mut stream, now);
+        }
+
+        let grace: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CancellationGracePeriod)
+            .unwrap_or(DEFAULT_CANCELLATION_GRACE_PERIOD);
+
+        if grace == 0 {
+            return Self::finalize_cancel(&env, stream_id, &key, &mut stream, now);
+        }
+
+        stream.cancel_effective_at = now.saturating_add(grace);
+        env.storage().persistent().set(&key, &stream);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "stream"),
+                Symbol::new(&env, "cancel_scheduled_via_gateway"),
+                stream_id,
+                employer.clone(),
+            ),
+            (stream.worker.clone(), stream.cancel_effective_at),
+        );
+
+        Ok(())
+    }
+
+    // Internal helper for creating streams (used by both create_stream and create_stream_via_gateway)
+    fn create_stream_internal(
+        env: Env,
+        employer: Address,
+        worker: Address,
+        token: Address,
+        rate: i128,
+        cliff_ts: u64,
+        start_ts: u64,
+        end_ts: u64,
+        metadata_hash: Option<BytesN<32>>,
+        speed_curve: Option<stream_curve::SpeedCurve>,
+    ) -> Result<u64, QuipayError> {
+        if rate <= 0 {
+            return Err(QuipayError::InvalidAmount);
+        }
+        if end_ts <= start_ts {
+            return Err(QuipayError::InvalidTimeRange);
+        }
+
+        let duration = end_ts.saturating_sub(start_ts);
+        if duration > Self::get_max_stream_duration(env.clone()) {
+            return Err(QuipayError::InvalidTimeRange);
+        }
+        if duration < Self::get_min_stream_duration(env.clone()) {
+            return Err(QuipayError::DurationTooShort);
+        }
+
+        let limit = Self::get_employer_stream_limit(env.clone(), employer.clone());
+        let emp_key = StreamKey::EmployerStreams(employer.clone());
+        let emp_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&emp_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut active_count = 0u32;
+        let mut i = 0u32;
+        while i < emp_ids.len() {
+            if let Some(id) = emp_ids.get(i) {
+                if let Some(s) = env
+                    .storage()
+                    .persistent()
+                    .get::<StreamKey, Stream>(&StreamKey::Stream(id))
+                {
+                    if !Self::is_closed(&s) {
+                        active_count += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        if active_count >= limit {
+            return Err(QuipayError::StreamLimitReached);
+        }
+
+        let effective_cliff = if cliff_ts <= start_ts {
+            start_ts
+        } else {
+            cliff_ts
+        };
+        if effective_cliff > end_ts {
+            return Err(QuipayError::InvalidCliff);
+        }
+
+        let now = env.ledger().timestamp();
+        if start_ts < now {
+            return Err(QuipayError::StartTimeInPast);
+        }
+
+        let duration = end_ts - start_ts;
+        let total_amount = rate
+            .checked_mul(i128::from(duration as i64))
+            .ok_or(QuipayError::Overflow)?;
+
+        let vault: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Vault)
+            .ok_or(QuipayError::NotInitialized)?;
+
+        use soroban_sdk::{IntoVal, Symbol, vec};
+
+        // Block stream creation if treasury would be insolvent
+        let solvent: bool = env.invoke_contract(
+            &vault,
+            &Symbol::new(&env, "check_solvency"),
+            vec![
+                &env,
+                token.clone().into_val(&env),
+                total_amount.into_val(&env),
+            ],
+        );
+        require!(solvent, QuipayError::InsufficientBalance);
+
+        env.invoke_contract::<()>(
+            &vault,
+            &Symbol::new(&env, "add_liability"),
+            vec![
+                &env,
+                token.clone().into_val(&env),
+                total_amount.into_val(&env),
+            ],
+        );
+
+        let mut next_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextStreamId)
+            .unwrap_or(1u64);
+        let stream_id = next_id;
+        next_id = next_id.checked_add(1).ok_or(QuipayError::Overflow)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::NextStreamId, &next_id);
+
+        let stream = Stream {
+            employer: employer.clone(),
+            worker: worker.clone(),
+            token: token.clone(),
+            rate,
+            cliff_ts: effective_cliff,
+            start_ts,
+            end_ts,
+            total_amount,
+            withdrawn_amount: 0,
+            last_withdrawal_ts: 0,
+            status: StreamStatus::Active,
+            created_at: now,
+            closed_at: 0,
+            paused_at: 0,
+            total_paused_duration: 0,
+            metadata_hash,
+            cancel_effective_at: 0,
+            speed_curve: speed_curve.unwrap_or(stream_curve::SpeedCurve::Linear),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&StreamKey::Stream(stream_id), &stream);
+
+        let emp_key = StreamKey::EmployerStreams(employer.clone());
+        let mut emp_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&emp_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        emp_ids.push_back(stream_id);
+        env.storage().persistent().set(&emp_key, &emp_ids);
+
+        let wrk_key = StreamKey::WorkerStreams(worker.clone());
+        let mut wrk_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&wrk_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        wrk_ids.push_back(stream_id);
+        env.storage().persistent().set(&wrk_key, &wrk_ids);
+
+        // Keep the new stream state and its worker index entry alive.
+        Self::bump_stream_storage_ttl(&env, stream_id, &worker);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "stream"),
+                Symbol::new(&env, "created_via_gateway"),
+                worker.clone(),
+                employer.clone(),
+            ),
+            (stream_id, token, rate, start_ts, end_ts),
+        );
+
+        Ok(stream_id)
+    }
+
+    pub fn get_stream(env: Env, stream_id: u64) -> Option<Stream> {
+        env.storage()
+            .persistent()
+            .get(&StreamKey::Stream(stream_id))
+    }
+
+    /// Returns the optional metadata hash for a stream.
+    /// The hash references an off-chain record (e.g. IPFS CID or database key)
+    /// containing human-readable context such as description, department, and payment type.
+    pub fn get_stream_metadata(env: Env, stream_id: u64) -> Option<BytesN<32>> {
+        let stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&StreamKey::Stream(stream_id))?;
+        stream.metadata_hash
+    }
+
+    pub fn get_withdrawable(env: Env, stream_id: u64) -> Option<i128> {
+        let key = StreamKey::Stream(stream_id);
+        let stream: Stream = env.storage().persistent().get(&key)?;
+
+        if Self::is_closed(&stream) {
+            return Some(0);
+        }
+
+        let now = env.ledger().timestamp();
+        let vested = Self::vested_amount(&stream, now);
+        Some(vested.checked_sub(stream.withdrawn_amount).unwrap_or(0))
+    }
+
+    /// Pure view: returns claimable amount without mutating state.
+    /// Claimable = min(streamed_amount - withdrawn_amount, vault_available_balance).
+    pub fn get_claimable(env: Env, stream_id: u64) -> Option<i128> {
+        let key = StreamKey::Stream(stream_id);
+        let stream: Stream = env.storage().persistent().get(&key)?;
+
+        if Self::is_closed(&stream) {
+            return Some(0);
+        }
+
+        let vault: Address = env.storage().instance().get(&DataKey::Vault)?;
+        let now = env.ledger().timestamp();
+        let vested = Self::vested_amount(&stream, now);
+        let streamed_claimable = vested.checked_sub(stream.withdrawn_amount).unwrap_or(0);
+        if streamed_claimable <= 0 {
+            return Some(0);
+        }
+
+        use soroban_sdk::{IntoVal, Symbol, vec};
+        let vault_balance: i128 = env.invoke_contract(
+            &vault,
+            &Symbol::new(&env, "get_balance"),
+            vec![&env, stream.token.clone().into_val(&env)],
+        );
+        if vault_balance <= 0 {
+            return Some(0);
+        }
+
+        Some(core::cmp::min(streamed_claimable, vault_balance))
+    }
+
+    /// Check if a stream is currently solvent (vault has enough funds to cover remaining liability)
+    pub fn is_stream_solvent(env: Env, stream_id: u64) -> Option<bool> {
+        let key = StreamKey::Stream(stream_id);
+        let stream: Stream = env.storage().persistent().get(&key)?;
+
+        // If stream is closed, it's considered solvent
+        if Self::is_closed(&stream) {
+            return Some(true);
+        }
+
+        let vault: Address = env.storage().instance().get(&DataKey::Vault)?;
+
+        // Calculate remaining liability
+        let remaining_liability = stream
+            .total_amount
+            .checked_sub(stream.withdrawn_amount)
+            .unwrap_or(0);
+
+        // Check vault solvency for this stream's remaining liability
+        use soroban_sdk::{IntoVal, Symbol, vec};
+        let solvent: bool = env.invoke_contract(
+            &vault,
+            &Symbol::new(&env, "check_solvency"),
+            vec![
+                &env,
+                stream.token.clone().into_val(&env),
+                remaining_liability.into_val(&env),
+            ],
+        );
+
+        Some(solvent)
+    }
+
+    /// Get stream health information including solvency ratio and days of runway
+    pub fn get_stream_health(env: Env, stream_id: u64) -> Option<StreamHealth> {
+        let key = StreamKey::Stream(stream_id);
+        let stream: Stream = env.storage().persistent().get(&key)?;
+
+        // If stream is closed, return perfect health
+        if Self::is_closed(&stream) {
+            return Some(StreamHealth {
+                solvency_ratio: 10000,    // 100%
+                days_of_runway: u64::MAX, // Infinite runway
+            });
+        }
+
+        let vault: Address = env.storage().instance().get(&DataKey::Vault)?;
+
+        let remaining_liability = stream
+            .total_amount
+            .checked_sub(stream.withdrawn_amount)
+            .ok_or(QuipayError::Overflow)?;
+
+        let cancel_fee = Self::calculate_early_cancel_fee(env, remaining_liability);
+        let fee_recipient = Self::get_fee_recipient(env.clone())?; // Get the configured fee recipient
+
+        if remaining_liability > 0 {
+            Self::call_vault_remove_liability(
+                env,
+                &vault,
+                stream.token.clone(),
+                remaining_liability,
+            );
+
+            if cancel_fee > 0 {
+                Self::call_vault_payout(
+                    env,
+                    &vault,
+                    fee_recipient.clone(), // Send fee to the configured recipient
+                    stream.token.clone(),
+                    cancel_fee,
+                );
+            }
+        }
+
+        Self::close_stream_internal(stream, now, StreamStatus::Canceled);
+        env.storage().persistent().set(key, stream);
+
+        env.events().publish(
+            (
+                soroban_sdk::Symbol::new(env, "stream"),
+                soroban_sdk::Symbol::new(env, "canceled"),
+                stream_id,
+                stream.employer.clone(),
+            ),
+            (stream.worker.clone(), stream.token.clone()),
+        );
+
+        Self::try_mint_receipt(env, stream, stream_id, 1u32); // 1 = Cancelled
+
+        stream.status = StreamStatus::Canceled;
+        stream.closed_at = now;
+
+        Ok(())
+    }
+
+    /// Set the authorized AutomationGateway contract address.
+    /// Only the admin can call this.
+    pub fn set_gateway(env: Env, gateway: Address) -> Result<(), QuipayError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(QuipayError::NotInitialized)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Gateway, &gateway);
+        Ok(())
+    }
+
+    /// Get the authorized AutomationGateway contract address.
+    pub fn get_gateway(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Gateway)
+    }
+
+    /// Create a stream via an authorized AutomationGateway on behalf of an employer.
+    /// Only the registered gateway can call this method.
+    pub fn create_stream_via_gateway(
+        env: Env,
+        employer: Address,
+        worker: Address,
+        token: Address,
+        rate: i128,
+        cliff_ts: u64,
+        start_ts: u64,
+        end_ts: u64,
+        metadata_hash: Option<BytesN<32>>,
+    ) -> Result<u64, QuipayError> {
+        Self::require_not_paused(&env)?;
+
+        // Verify the caller is the authorized gateway
+        let gateway: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Gateway)
+            .ok_or(QuipayError::NotInitialized)?;
+        gateway.require_auth();
+
+        // Call the internal create stream logic
+        Self::create_stream_internal(
+            env,
+            employer,
+            worker,
+            token,
+            rate,
+            cliff_ts,
+            start_ts,
+            end_ts,
+            metadata_hash,
+            core::option::Option::<stream_curve::SpeedCurve>::None, // speed_curve not supported via gateway yet
+        )
+    }
+
+    /// Set the authorized DAO governance contract address.
+    /// Only admin can call this.
+    pub fn set_dao_governance(env: Env, dao: Address) -> Result<(), QuipayError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(QuipayError::NotInitialized)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::DaoGovernance, &dao);
+        Ok(())
+    }
+
+    /// Get the authorized DAO governance contract address.
+    pub fn get_dao_governance(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::DaoGovernance)
+    }
+
+    /// Create a stream via an executed DAO governance proposal.
+    /// Only the registered DaoGovernance contract can call this method.
+    pub fn create_stream_via_governance(
+        env: Env,
+        employer: Address,
+        worker: Address,
+        token: Address,
+        rate: i128,
+        cliff_ts: u64,
+        start_ts: u64,
+        end_ts: u64,
+        metadata_hash: Option<BytesN<32>>,
+    ) -> Result<u64, QuipayError> {
+        Self::require_not_paused(&env)?;
+
+        // Verify the caller is the authorized DAO governance contract
+        let dao: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::DaoGovernance)
+            .ok_or(QuipayError::NotInitialized)?;
+        dao.require_auth();
+
+        let stream_id = Self::create_stream_internal(
+            env.clone(),
+            employer.clone(),
+            worker.clone(),
+            token.clone(),
+            rate,
+            cliff_ts,
+            start_ts,
+            end_ts,
+            metadata_hash,
+            core::option::Option::<stream_curve::SpeedCurve>::None,
+        )?;
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "stream"),
+                Symbol::new(&env, "created_via_governance"),
+                worker,
+                employer,
+            ),
+            (stream_id, token, rate, start_ts, end_ts),
+        );
+
+        Ok(stream_id)
+    }
+
+    /// Cancel a stream via an authorized AutomationGateway on behalf of an employer.
+    /// Only the registered gateway can call this method.
+    pub fn cancel_stream_via_gateway(
+        env: Env,
+        stream_id: u64,
+        employer: Address,
+    ) -> Result<(), QuipayError> {
+        Self::require_not_paused(&env)?;
+
+        // Verify the caller is the authorized gateway
+        let gateway: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Gateway)
+            .ok_or(QuipayError::NotInitialized)?;
+        gateway.require_auth();
+
+        let key = StreamKey::Stream(stream_id);
+        let mut stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(QuipayError::StreamNotFound)?;
+
+        if stream.employer != employer {
+            return Err(QuipayError::NotEmployer);
+        }
+        if Self::is_closed(&stream) {
+            return Ok(());
+        }
+
+        let now = env.ledger().timestamp();
+
+        // If a grace period is already active, reject duplicate request.
+        if stream.cancel_effective_at > 0 && now < stream.cancel_effective_at {
+            return Err(QuipayError::GracePeriodActive);
+        }
+
+        // If the grace period has elapsed, finalize now.
+        if stream.cancel_effective_at > 0 && now >= stream.cancel_effective_at {
+            return Self::finalize_cancel(&env, stream_id, &key, &mut stream, now);
+        }
+
+        let grace: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CancellationGracePeriod)
+            .unwrap_or(DEFAULT_CANCELLATION_GRACE_PERIOD);
+
+        if grace == 0 {
+            return Self::finalize_cancel(&env, stream_id, &key, &mut stream, now);
+        }
+
+        stream.cancel_effective_at = now.saturating_add(grace);
+        env.storage().persistent().set(&key, &stream);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "stream"),
+                Symbol::new(&env, "cancel_scheduled_via_gateway"),
+                stream_id,
+                employer.clone(),
+            ),
+            (stream.worker.clone(), stream.cancel_effective_at),
+        );
+
+        Ok(())
+    }
+
+    // Internal helper for creating streams (used by both create_stream and create_stream_via_gateway)
+    fn create_stream_internal(
+        env: Env,
+        employer: Address,
+        worker: Address,
+        token: Address,
+        rate: i128,
+        cliff_ts: u64,
+        start_ts: u64,
+        end_ts: u64,
+        metadata_hash: Option<BytesN<32>>,
+        speed_curve: Option<stream_curve::SpeedCurve>,
+    ) -> Result<u64, QuipayError> {
+        if rate <= 0 {
+            return Err(QuipayError::InvalidAmount);
+        }
+        if end_ts <= start_ts {
+            return Err(QuipayError::InvalidTimeRange);
+        }
+
+        let duration = end_ts.saturating_sub(start_ts);
+        if duration > Self::get_max_stream_duration(env.clone()) {
+            return Err(QuipayError::InvalidTimeRange);
+        }
+        if duration < Self::get_min_stream_duration(env.clone()) {
+            return Err(QuipayError::DurationTooShort);
+        }
+
+        let limit = Self::get_employer_stream_limit(env.clone(), employer.clone());
+        let emp_key = StreamKey::EmployerStreams(employer.clone());
+        let emp_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&emp_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut active_count = 0u32;
+        let mut i = 0u32;
+        while i < emp_ids.len() {
+            if let Some(id) = emp_ids.get(i) {
+                if let Some(s) = env
+                    .storage()
+                    .persistent()
+                    .get::<StreamKey, Stream>(&StreamKey::Stream(id))
+                {
+                    if !Self::is_closed(&s) {
+                        active_count += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        if active_count >= limit {
+            return Err(QuipayError::StreamLimitReached);
+        }
+
+        let effective_cliff = if cliff_ts <= start_ts {
+            start_ts
+        } else {
+            cliff_ts
+        };
+        if effective_cliff > end_ts {
+            return Err(QuipayError::InvalidCliff);
+        }
+
+        let now = env.ledger().timestamp();
+        if start_ts < now {
+            return Err(QuipayError::StartTimeInPast);
+        }
+
+        let duration = end_ts - start_ts;
+        let total_amount = rate
+            .checked_mul(i128::from(duration as i64))
+            .ok_or(QuipayError::Overflow)?;
+
+        let vault: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Vault)
+            .ok_or(QuipayError::NotInitialized)?;
+
+        use soroban_sdk::{IntoVal, Symbol, vec};
+
+        // Block stream creation if treasury would be insolvent
+        let solvent: bool = env.invoke_contract(
+            &vault,
+            &Symbol::new(&env, "check_solvency"),
+            vec![
+                &env,
+                token.clone().into_val(&env),
+                total_amount.into_val(&env),
+            ],
+        );
+        require!(solvent, QuipayError::InsufficientBalance);
+
+        env.invoke_contract::<()>(
+            &vault,
+            &Symbol::new(&env, "add_liability"),
+            vec![
+                &env,
+                token.clone().into_val(&env),
+                total_amount.into_val(&env),
+            ],
+        );
+
+        let mut next_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextStreamId)
+            .unwrap_or(1u64);
+        let stream_id = next_id;
+        next_id = next_id.checked_add(1).ok_or(QuipayError::Overflow)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::NextStreamId, &next_id);
+
+        let stream = Stream {
+            employer: employer.clone(),
+            worker: worker.clone(),
+            token: token.clone(),
+            rate,
+            cliff_ts: effective_cliff,
+            start_ts,
+            end_ts,
+            total_amount,
+            withdrawn_amount: 0,
+            last_withdrawal_ts: 0,
+            status: StreamStatus::Active,
+            created_at: now,
+            closed_at: 0,
+            paused_at: 0,
+            total_paused_duration: 0,
+            metadata_hash,
+            cancel_effective_at: 0,
+            speed_curve: speed_curve.unwrap_or(stream_curve::SpeedCurve::Linear),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&StreamKey::Stream(stream_id), &stream);
+
+        let emp_key = StreamKey::EmployerStreams(employer.clone());
+        let mut emp_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&emp_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        emp_ids.push_back(stream_id);
+        env.storage().persistent().set(&emp_key, &emp_ids);
+
+        let wrk_key = StreamKey::WorkerStreams(worker.clone());
+        let mut wrk_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&wrk_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        wrk_ids.push_back(stream_id);
+        env.storage().persistent().set(&wrk_key, &wrk_ids);
+
+        // Keep the new stream state and its worker index entry alive.
+        Self::bump_stream_storage_ttl(&env, stream_id, &worker);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "stream"),
+                Symbol::new(&env, "created_via_gateway"),
+                worker.clone(),
+                employer.clone(),
+            ),
+            (stream_id, token, rate, start_ts, end_ts),
+        );
+
+        Ok(stream_id)
+    }
+
+    pub fn get_stream(env: Env, stream_id: u64) -> Option<Stream> {
+        env.storage()
+            .persistent()
+            .get(&StreamKey::Stream(stream_id))
+    }
+
+    /// Returns the optional metadata hash for a stream.
+    /// The hash references an off-chain record (e.g. IPFS CID or database key)
+    /// containing human-readable context such as description, department, and payment type.
+    pub fn get_stream_metadata(env: Env, stream_id: u64) -> Option<BytesN<32>> {
+        let stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&StreamKey::Stream(stream_id))?;
+        stream.metadata_hash
+    }
+
+    pub fn get_withdrawable(env: Env, stream_id: u64) -> Option<i128> {
+        let key = StreamKey::Stream(stream_id);
+        let stream: Stream = env.storage().persistent().get(&key)?;
+
+        if Self::is_closed(&stream) {
+            return Some(0);
+        }
+
+        let now = env.ledger().timestamp();
+        let vested = Self::vested_amount(&stream, now);
+        Some(vested.checked_sub(stream.withdrawn_amount).unwrap_or(0))
+    }
+
+    /// Pure view: returns claimable amount without mutating state.
+    /// Claimable = min(streamed_amount - withdrawn_amount, vault_available_balance).
+    pub fn get_claimable(env: Env, stream_id: u64) -> Option<i128> {
+        let key = StreamKey::Stream(stream_id);
+        let stream: Stream = env.storage().persistent().get(&key)?;
+
+        if Self::is_closed(&stream) {
+            return Some(0);
+        }
+
+        let vault: Address = env.storage().instance().get(&DataKey::Vault)?;
+        let now = env.ledger().timestamp();
+        let vested = Self::vested_amount(&stream, now);
+        let streamed_claimable = vested.checked_sub(stream.withdrawn_amount).unwrap_or(0);
+        if streamed_claimable <= 0 {
+            return Some(0);
+        }
+
+        use soroban_sdk::{IntoVal, Symbol, vec};
+        let vault_balance: i128 = env.invoke_contract(
+            &vault,
+            &Symbol::new(&env, "get_balance"),
+            vec![&env, stream.token.clone().into_val(&env)],
+        );
+        if vault_balance <= 0 {
+            return Some(0);
+        }
+
+        Some(core::cmp::min(streamed_claimable, vault_balance))
+    }
+
+    /// Check if a stream is currently solvent (vault has enough funds to cover remaining liability)
+    pub fn is_stream_solvent(env: Env, stream_id: u64) -> Option<bool> {
+        let key = StreamKey::Stream(stream_id);
+        let stream: Stream = env.storage().persistent().get(&key)?;
+
+        // If stream is closed, it's considered solvent
+        if Self::is_closed(&stream) {
+            return Some(true);
+        }
+
+        let vault: Address = env.storage().instance().get(&DataKey::Vault)?;
+
+        // Calculate remaining liability
+        let remaining_liability = stream
+            .total_amount
+            .checked_sub(stream.withdrawn_amount)
+            .unwrap_or(0);
+
+        // Check vault solvency for this stream's remaining liability
+        use soroban_sdk::{IntoVal, Symbol, vec};
+        let solvent: bool = env.invoke_contract(
+            &vault,
+            &Symbol::new(&env, "check_solvency"),
+            vec![
+                &env,
+                stream.token.clone().into_val(&env),
+                remaining_liability.into_val(&env),
+            ],
+        );
+
+        Some(solvent)
+    }
+
+    /// Get stream health information including solvency ratio and days of runway
+    pub fn get_stream_health(env: Env, stream_id: u64) -> Option<StreamHealth> {
+        let key = StreamKey::Stream(stream_id);
+        let stream: Stream = env.storage().persistent().get(&key)?;
+
+        // If stream is closed, return perfect health
+        if Self::is_closed(&stream) {
+            return Some(StreamHealth {
+                solvency_ratio: 10000,    // 100%
+                days_of_runway: u64::MAX, // Infinite runway
+            });
+        }
+
+        let vault: Address = env.storage().instance().get(&DataKey::Vault)?;
+
+        let remaining_liability = stream
+            .total_amount
+            .checked_sub(stream.withdrawn_amount)
+            .unwrap_or(0);
+
+        // If no remaining liability, stream is fully funded
+        if remaining_liability == 0 {
+            return Some(StreamHealth {
+                solvency_ratio: 10000,    // 100%
+                days_of_runway: u64::MAX, // Infinite runway
+            });
+        }
+
+        use soroban_sdk::{IntoVal, Symbol, vec};
+
+        // Get vault balance and liability for this token
+        let vault_balance: i128 = env.invoke_contract(
+            &vault,
+            &Symbol::new(&env, "get_balance"),
+            vec![&env, stream.token.clone().into_val(&env)],
+        );
+
+        let vault_liability: i128 = env.invoke_contract(
+            &vault,
+            &Symbol::new(&env, "get_liability"),
+            vec![&env, stream.token.clone().into_val(&env)],
+        );
+
+        let available_balance = vault_balance.saturating_sub(vault_liability);
+
+        // Calculate solvency ratio as basis points (10000 = 100%)
+        let solvency_ratio = if remaining_liability > 0 {
+            let ratio = available_balance
+                .checked_mul(10000)
+                .unwrap_or(0)
+                .checked_div(remaining_liability)
+                .unwrap_or(0);
+            ratio.min(10000) // Cap at 100%
+        } else {
+            10000
+        };
+
+        // Calculate days of runway based on stream rate
+        let days_of_runway = if stream.rate > 0 && available_balance > 0 {
+            let seconds_of_runway = available_balance / stream.rate;
+            (seconds_of_runway / (24 * 60 * 60)) as u64 // Convert to days
+        } else if available_balance >= remaining_liability {
+            u64::MAX // Infinite runway if fully funded
+        } else {
+            0 // No runway if insufficient funds
+        };
+
+        Some(StreamHealth {
+            solvency_ratio,
+            days_of_runway,
+        })
+    }
+
+    pub fn get_streams_by_employer(
+        env: Env,
+        employer: Address,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> Vec<u64> {
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&StreamKey::EmployerStreams(employer))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        Self::paginate(&env, ids, offset, limit)
+    }
+
+    pub fn get_streams_by_worker(
+        env: Env,
+        worker: Address,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> Vec<u64> {
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&StreamKey::WorkerStreams(worker))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        Self::paginate(&env, ids, offset, limit)
+    }
+
+    /// Paginate a list of stream IDs with bounds checking.
     ///
-    /// Subtracts `total_paused_duration` from elapsed time so workers are only
-    /// paid for active (non-paused) time. Caps the result at `total_amount`.
+    /// ### DoS Protection
+    /// The `limit` parameter is capped at `MAX_PAGE_SIZE` (1000) to prevent
+    /// performance issues from excessively large page requests.
+    ///
+    /// ### Parameters
+    /// - `ids`: Full list of stream IDs to paginate
+    /// - `offset`: Starting index (default: 0)
+    /// - `limit`: Maximum items to return (default: all, capped at MAX_PAGE_SIZE)
+    ///
+    /// ### Returns
+    /// A subset of `ids` from `offset` to `offset + min(limit, MAX_PAGE_SIZE)`
+    fn paginate(env: &Env, ids: Vec<u64>, offset: Option<u32>, limit: Option<u32>) -> Vec<u64> {
+        let offset = offset.unwrap_or(0);
+        let ids_len = ids.len();
+        // Cap limit at MAX_PAGE_SIZE to prevent DoS
+        let requested_limit = limit.unwrap_or(ids_len);
+        let limit = requested_limit.min(MAX_PAGE_SIZE).min(ids_len);
+
+        let mut result = Vec::new(env);
+        if offset >= ids_len {
+            return result;
+        }
+
+        let end = (offset + limit).min(ids_len);
+
+        for i in offset..end {
+            if let Some(id) = ids.get(i) {
+                result.push_back(id);
+            }
+        }
+        result
+    }
+
+    pub fn cleanup_stream(env: Env, stream_id: u64) -> Result<(), QuipayError> {
+        let key = StreamKey::Stream(stream_id);
+        let stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(QuipayError::StreamNotFound)?;
+
+        require!(Self::is_closed(&stream), QuipayError::StreamNotClosed);
+
+        let retention: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RetentionSecs)
+            .unwrap_or(DEFAULT_RETENTION_SECS);
+
+        let now = env.ledger().timestamp();
+        if now < stream.closed_at.saturating_add(retention) {
+            return Err(QuipayError::RetentionNotMet);
+        }
+
+        Self::remove_from_index(&env, StreamKey::EmployerStreams(stream.employer), stream_id);
+        Self::remove_from_index(&env, StreamKey::WorkerStreams(stream.worker), stream_id);
+
+        env.storage().persistent().remove(&key);
+        Ok(())
+    }
+
+    /// Propose an upgrade with a 48-hour timelock
+    /// Only admin can call this function
+    pub fn propose_upgrade(
+        env: Env,
+        new_wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), QuipayError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(QuipayError::NotInitialized)?;
+        admin.require_auth();
+
+        let now = env.ledger().timestamp();
+        let execute_after = now.saturating_add(TIMELOCK_DURATION);
+
+        // Check if there's already a pending upgrade
+        if env.storage().instance().has(&DataKey::PendingUpgrade) {
+            return Err(QuipayError::Custom);
+        }
+
+        let pending_upgrade = PendingUpgrade {
+            wasm_hash: new_wasm_hash.clone(),
+            execute_after,
+            proposed_at: now,
+            proposed_by: admin.clone(),
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpgrade, &pending_upgrade);
+
+        // Emit upgrade proposed event
+        #[allow(deprecated)]
+        env.events()
+            .publish((UPGRADE_PROPOSED, admin), (new_wasm_hash, execute_after));
+
+        Ok(())
+    }
+
+    /// Execute a proposed upgrade after timelock period
+    /// Only admin can call this function
+    pub fn execute_upgrade(env: Env) -> Result<(), QuipayError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(QuipayError::NotInitialized)?;
+        admin.require_auth();
+
+        let pending_upgrade: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .ok_or(QuipayError::Custom)?;
+
+        let now = env.ledger().timestamp();
+        if now < pending_upgrade.execute_after {
+            return Err(QuipayError::Custom);
+        }
+
+        // Perform the upgrade
+        env.deployer()
+            .update_current_contract_wasm(pending_upgrade.wasm_hash.clone());
+
+        // Clear pending upgrade
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+
+        // Emit upgrade executed event
+        #[allow(deprecated)]
+        env.events()
+            .publish((UPGRADE_EXECUTED, admin), (pending_upgrade.wasm_hash, now));
+
+        Ok(())
+    }
+
+    /// Cancel a pending upgrade
+    /// Only admin can call this function
+    pub fn cancel_upgrade(env: Env) -> Result<(), QuipayError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(QuipayError::NotInitialized)?;
+        admin.require_auth();
+
+        let pending_upgrade: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .ok_or(QuipayError::Custom)?;
+
+        // Clear pending upgrade
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+
+        // Emit upgrade canceled event
+        #[allow(deprecated)]
+        env.events().publish(
+            (UPGRADE_CANCELED, admin),
+            (pending_upgrade.wasm_hash, pending_upgrade.execute_after),
+        );
+
+        Ok(())
+    }
+
+    /// Get the current pending upgrade (if any)
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage().instance().get(&DataKey::PendingUpgrade)
+    }
+
+    /// Get the current early cancellation fee in basis points
+    pub fn get_early_cancel_fee(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::EarlyCancelFeeBps)
+            .unwrap_or(0)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), QuipayError> {
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(QuipayError::ProtocolPaused);
+        }
+        Ok(())
+    }
+
+    fn is_closed(stream: &Stream) -> bool {
+        stream.status == StreamStatus::Canceled || stream.status == StreamStatus::Completed
+    }
+
+    fn bump_stream_storage_ttl(env: &Env, stream_id: u64, worker: &Address) {
+        let stream_key = StreamKey::Stream(stream_id);
+        env.storage().persistent().extend_ttl(
+            &stream_key,
+            STORAGE_TTL_THRESHOLD_LEDGER,
+            STORAGE_TTL_EXTEND_TO_LEDGER,
+        );
+
+        let worker_key = StreamKey::WorkerStreams(worker.clone());
+        env.storage().persistent().extend_ttl(
+            &worker_key,
+            STORAGE_TTL_THRESHOLD_LEDGER,
+            STORAGE_TTL_EXTEND_TO_LEDGER,
+        );
+    }
+
+    fn close_stream_internal(stream: &mut Stream, now: u64, status: StreamStatus) {
+        stream.status = status;
+        stream.closed_at = now;
+    }
+
+    fn remove_from_index(env: &Env, key: StreamKey, stream_id: u64) {
+        let ids: Vec<u64> = match env.storage().persistent().get(&key) {
+            Some(v) => v,
+            None => return,
+        };
+        let mut new_ids: Vec<u64> = Vec::new(env);
+        let mut i = 0u32;
+        while i < ids.len() {
+            if let Some(id) = ids.get(i) {
+                if id != stream_id {
+                    new_ids.push_back(id);
+                }
+            }
+            i += 1;
+        }
+        if new_ids.len() == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &new_ids);
+        }
+    }
+
+    fn vested_amount(stream: &Stream, now: u64) -> i128 {
+        Self::vested_amount_at(stream, now)
+    }
+
+    /// Calculate early cancellation fee based on remaining amount
+    fn calculate_early_cancel_fee(env: &Env, remaining_amount: i128) -> i128 {
+        let fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EarlyCancelFeeBps)
+            .unwrap_or(0); // Default to 0 if not set
+
+        if fee_bps == 0 || remaining_amount <= 0 {
+            return 0;
+        }
+
+        remaining_amount
+            .checked_mul(fee_bps as i128)
+            .unwrap_or(0)
+            .checked_div(10000) // Convert basis points to actual amount
+            .unwrap_or(0)
+    }
+
+    /// Invoke `payout_liability` on the vault contract.
+    pub(crate) fn call_vault_payout(
+        env: &Env,
+        vault: &Address,
+        worker: Address,
+        token: Address,
+        amount: i128,
+    ) {
+        use soroban_sdk::{IntoVal, Symbol, vec};
+        env.invoke_contract::<()>(
+            vault,
+            &Symbol::new(env, "payout_liability"),
+            vec![
+                env,
+                worker.into_val(env),
+                token.into_val(env),
+                amount.into_val(env),
+            ],
+        );
+    }
+
+    /// Invoke `remove_liability` on the vault contract.
+    pub(crate) fn call_vault_remove_liability(
+        env: &Env,
+        vault: &Address,
+        token: Address,
+        amount: i128,
+    ) {
+        use soroban_sdk::{IntoVal, Symbol, vec};
+        env.invoke_contract::<()>(
+            vault,
+            &Symbol::new(env, "remove_liability"),
+            vec![env, token.into_val(env), amount.into_val(env)],
+        );
+    }
+
+    /// If a PayrollReceipt contract is registered, mint a receipt for the closed stream.
+    /// Failures are silently ignored so they never block stream closure.
+    pub(crate) fn try_mint_receipt(
+        env: &Env,
+        stream: &Stream,
+        stream_id: u64,
+        reason: u32, // 0 = Completed, 1 = Cancelled
+    ) {
+        use soroban_sdk::{IntoVal, Symbol, vec};
+        let Some(receipt_addr): Option<Address> =
+            env.storage().instance().get(&DataKey::Receipt)
+        else {
+            return;
+        };
+        // ClosureReason enum discriminant is passed as u32 to avoid a cross-crate
+        // contracttype dependency at the call site.
+        let _ = env.try_invoke_contract::<u64, ()>(
+            &receipt_addr,
+            &Symbol::new(env, "mint"),
+            vec![
+                env,
+                stream_id.into_val(env),
+                stream.employer.clone().into_val(env),
+                stream.worker.clone().into_val(env),
+                stream.token.clone().into_val(env),
+                stream.withdrawn_amount.into_val(env),
+                stream.start_ts.into_val(env),
+                stream.end_ts.into_val(env),
+                stream.closed_at.into_val(env),
+                reason.into_val(env),
+            ],
+        );
+    }
+
+    pub(crate) fn vested_amount_at(stream: &Stream, timestamp: u64) -> i128 {
+        let is_closed = Self::is_closed(stream);
+        let mut effective_ts = if is_closed {
+            core::cmp::min(timestamp, stream.closed_at)
+        } else {
+            timestamp
+        };
+
+        // Adjust effective_ts for currently paused streams
+        if stream.status == StreamStatus::Paused {
+            effective_ts = core::cmp::min(effective_ts, stream.paused_at);
+        }
+
+        // Cap vesting at cancel_effective_at when a grace period is pending
+        if !is_closed && stream.cancel_effective_at > 0 {
+            effective_ts = core::cmp::min(effective_ts, stream.cancel_effective_at);
+        }
+
+        // Subtract total paused duration from the elapsed time
+        let elapsed_reduction = stream.total_paused_duration;
+
+        if effective_ts < stream.cliff_ts {
+            return 0;
+        }
+
+        let start_with_pauses = stream.start_ts.saturating_add(elapsed_reduction);
+
+        if effective_ts <= start_with_pauses {
+            if effective_ts == start_with_pauses && stream.end_ts == stream.start_ts {
+                return stream.total_amount;
+            }
+            return 0;
+        }
+
+        let end_with_pauses = stream.end_ts.saturating_add(elapsed_reduction);
+
+        if effective_ts >= end_with_pauses
+            || (stream.status == StreamStatus::Completed && effective_ts >= stream.closed_at)
+        {
+            return stream.total_amount;
+        }
+
+        let elapsed: u64 = effective_ts.saturating_sub(start_with_pauses);
+        let duration: u64 = stream.end_ts.saturating_sub(stream.start_ts);
+        if duration == 0 {
+            return stream.total_amount;
+        }
+
+        // Delegate to the curve module — all three curves share the same
+        // boundary guarantees and integer-safe implementation.
+        stream_curve::compute_vested(elapsed, duration, stream.total_amount, stream.speed_curve)
+    }
+
+    pub fn raise_dispute(
+        env: Env,
+        stream_id: u64,
+        caller: Address,
+        reason_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), QuipayError> {
+        Self::require_not_paused(&env)?;
+        dispute::raise_dispute(&env, stream_id, &caller, reason_hash)
+    }
+
+    pub fn resolve_dispute(
+        env: Env,
+        stream_id: u64,
+        arbitrator: Address,
+        outcome: DisputeOutcome,
+    ) -> Result<(), QuipayError> {
+        Self::require_not_paused(&env)?;
+        dispute::resolve_dispute(&env, stream_id, &arbitrator, outcome)
+    }
+
+    pub fn get_dispute(env: Env, stream_id: u64) -> Option<dispute::Dispute> {
+        dispute::get_dispute(&env, stream_id)
+    }
+
+    pub fn has_open_dispute(env: Env, stream_id: u64) -> bool {
+        dispute::has_open_dispute(&env, stream_id)
+    }
+}
+
+mod dispute;
+mod extension_test;
+mod pause_test;
+mod stream_extension;
+mod stream_pause;
+
+mod stream_curve;
+mod test;
+
+#[cfg(test)]
+mod duration_test;
+
+#[cfg(test)]
+mod batch_cancel_test;
+
+#[cfg(test)]
+mod batch_claim_test;
+
+#[cfg(test)]
+mod cancel_grace_test;
+
+#[cfg(test)]
+mod integration_test;
+
+#[cfg(test)]
+mod proptest;
+
+#[cfg(test)]
+mod withdraw_proptest;
+mod upgrade_migration_test;
+#[cfg(test)]
+mod fee_recipient_test;
+            .unwrap_or(0);
+
+        // If no remaining liability, stream is fully funded
+        if remaining_liability == 0 {
+            return Some(StreamHealth {
+                solvency_ratio: 10000,    // 100%
+                days_of_runway: u64::MAX, // Infinite runway
+            });
+        }
+
+        use soroban_sdk::{IntoVal, Symbol, vec};
+
+        // Get vault balance and liability for this token
+        let vault_balance: i128 = env.invoke_contract(
+            &vault,
+            &Symbol::new(&env, "get_balance"),
+            vec![&env, stream.token.clone().into_val(&env)],
+        );
+
+        let vault_liability: i128 = env.invoke_contract(
+            &vault,
+            &Symbol::new(&env, "get_liability"),
+            vec![&env, stream.token.clone().into_val(&env)],
+        );
+
+        let available_balance = vault_balance.saturating_sub(vault_liability);
+
+        // Calculate solvency ratio as basis points (10000 = 100%)
+        let solvency_ratio = if remaining_liability > 0 {
+            let ratio = available_balance
+                .checked_mul(10000)
+                .unwrap_or(0)
+                .checked_div(remaining_liability)
+                .unwrap_or(0);
+            ratio.min(10000) // Cap at 100%
+        } else {
+            10000
+        };
+
+        // Calculate days of runway based on stream rate
+        let days_of_runway = if stream.rate > 0 && available_balance > 0 {
+            let seconds_of_runway = available_balance / stream.rate;
+            (seconds_of_runway / (24 * 60 * 60)) as u64 // Convert to days
+        } else if available_balance >= remaining_liability {
+            u64::MAX // Infinite runway if fully funded
+        } else {
+            0 // No runway if insufficient funds
+        };
+
+        Some(StreamHealth {
+            solvency_ratio,
+            days_of_runway,
+        })
+    }
+
+    pub fn get_streams_by_employer(
+        env: Env,
+        employer: Address,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> Vec<u64> {
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&StreamKey::EmployerStreams(employer))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        Self::paginate(&env, ids, offset, limit)
+    }
+
+    pub fn get_streams_by_worker(
+        env: Env,
+        worker: Address,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> Vec<u64> {
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&StreamKey::WorkerStreams(worker))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        Self::paginate(&env, ids, offset, limit)
+    }
+
+    /// Paginate a list of stream IDs with bounds checking.
+    ///
+    /// ### DoS Protection
+    /// The `limit` parameter is capped at `MAX_PAGE_SIZE` (1000) to prevent
+    /// performance issues from excessively large page requests.
+    ///
+    /// ### Parameters
+    /// - `ids`: Full list of stream IDs to paginate
+    /// - `offset`: Starting index (default: 0)
+    /// - `limit`: Maximum items to return (default: all, capped at MAX_PAGE_SIZE)
+    ///
+    /// ### Returns
+    /// A subset of `ids` from `offset` to `offset + min(limit, MAX_PAGE_SIZE)`
+    fn paginate(env: &Env, ids: Vec<u64>, offset: Option<u32>, limit: Option<u32>) -> Vec<u64> {
+        let offset = offset.unwrap_or(0);
+        let ids_len = ids.len();
+        // Cap limit at MAX_PAGE_SIZE to prevent DoS
+        let requested_limit = limit.unwrap_or(ids_len);
+        let limit = requested_limit.min(MAX_PAGE_SIZE).min(ids_len);
+
+        let mut result = Vec::new(env);
+        if offset >= ids_len {
+            return result;
+        }
+
+        let end = (offset + limit).min(ids_len);
+
+        for i in offset..end {
+            if let Some(id) = ids.get(i) {
+                result.push_back(id);
+            }
+        }
+        result
+    }
+
+    pub fn cleanup_stream(env: Env, stream_id: u64) -> Result<(), QuipayError> {
+        let key = StreamKey::Stream(stream_id);
+        let stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(QuipayError::StreamNotFound)?;
+
+        require!(Self::is_closed(&stream), QuipayError::StreamNotClosed);
+
+        let retention: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RetentionSecs)
+            .unwrap_or(DEFAULT_RETENTION_SECS);
+
+        let now = env.ledger().timestamp();
+        if now < stream.closed_at.saturating_add(retention) {
+            return Err(QuipayError::RetentionNotMet);
+        }
+
+        Self::remove_from_index(&env, StreamKey::EmployerStreams(stream.employer), stream_id);
+        Self::remove_from_index(&env, StreamKey::WorkerStreams(stream.worker), stream_id);
+
+        env.storage().persistent().remove(&key);
+        Ok(())
+    }
+
+    /// Propose an upgrade with a 48-hour timelock
+    /// Only admin can call this function
+    pub fn propose_upgrade(
+        env: Env,
+        new_wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), QuipayError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(QuipayError::NotInitialized)?;
+        admin.require_auth();
+
+        let now = env.ledger().timestamp();
+        let execute_after = now.saturating_add(TIMELOCK_DURATION);
+
+        // Check if there's already a pending upgrade
+        if env.storage().instance().has(&DataKey::PendingUpgrade) {
+            return Err(QuipayError::Custom);
+        }
+
+        let pending_upgrade = PendingUpgrade {
+            wasm_hash: new_wasm_hash.clone(),
+            execute_after,
+            proposed_at: now,
+            proposed_by: admin.clone(),
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpgrade, &pending_upgrade);
+
+        // Emit upgrade proposed event
+        #[allow(deprecated)]
+        env.events()
+            .publish((UPGRADE_PROPOSED, admin), (new_wasm_hash, execute_after));
+
+        Ok(())
+    }
+
+    /// Execute a proposed upgrade after timelock period
+    /// Only admin can call this function
+    pub fn execute_upgrade(env: Env) -> Result<(), QuipayError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(QuipayError::NotInitialized)?;
+        admin.require_auth();
+
+        let pending_upgrade: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .ok_or(QuipayError::Custom)?;
+
+        let now = env.ledger().timestamp();
+        if now < pending_upgrade.execute_after {
+            return Err(QuipayError::Custom);
+        }
+
+        // Perform the upgrade
+        env.deployer()
+            .update_current_contract_wasm(pending_upgrade.wasm_hash.clone());
+
+        // Clear pending upgrade
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+
+        // Emit upgrade executed event
+        #[allow(deprecated)]
+        env.events()
+            .publish((UPGRADE_EXECUTED, admin), (pending_upgrade.wasm_hash, now));
+
+        Ok(())
+    }
+
+    /// Cancel a pending upgrade
+    /// Only admin can call this function
+    pub fn cancel_upgrade(env: Env) -> Result<(), QuipayError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(QuipayError::NotInitialized)?;
+        admin.require_auth();
+
+        let pending_upgrade: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .ok_or(QuipayError::Custom)?;
+
+        // Clear pending upgrade
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+
+        // Emit upgrade canceled event
+        #[allow(deprecated)]
+        env.events().publish(
+            (UPGRADE_CANCELED, admin),
+            (pending_upgrade.wasm_hash, pending_upgrade.execute_after),
+        );
+
+        Ok(())
+    }
+
+    /// Get the current pending upgrade (if any)
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage().instance().get(&DataKey::PendingUpgrade)
+    }
+
+    /// Get the current early cancellation fee in basis points
+    pub fn get_early_cancel_fee(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::EarlyCancelFeeBps)
+            .unwrap_or(0)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), QuipayError> {
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(QuipayError::ProtocolPaused);
+        }
+        Ok(())
+    }
+
+    fn is_closed(stream: &Stream) -> bool {
+        stream.status == StreamStatus::Canceled || stream.status == StreamStatus::Completed
+    }
+
+    fn bump_stream_storage_ttl(env: &Env, stream_id: u64, worker: &Address) {
+        let stream_key = StreamKey::Stream(stream_id);
+        env.storage().persistent().extend_ttl(
+            &stream_key,
+            STORAGE_TTL_THRESHOLD_LEDGER,
+            STORAGE_TTL_EXTEND_TO_LEDGER,
+        );
+
+        let worker_key = StreamKey::WorkerStreams(worker.clone());
+        env.storage().persistent().extend_ttl(
+            &worker_key,
+            STORAGE_TTL_THRESHOLD_LEDGER,
+            STORAGE_TTL_EXTEND_TO_LEDGER,
+        );
+    }
+
+    fn close_stream_internal(stream: &mut Stream, now: u64, status: StreamStatus) {
+        stream.status = status;
+        stream.closed_at = now;
+    }
+
+    fn remove_from_index(env: &Env, key: StreamKey, stream_id: u64) {
+        let ids: Vec<u64> = match env.storage().persistent().get(&key) {
+            Some(v) => v,
+            None => return,
+        };
+        let mut new_ids: Vec<u64> = Vec::new(env);
+        let mut i = 0u32;
+        while i < ids.len() {
+            if let Some(id) = ids.get(i) {
+                if id != stream_id {
+                    new_ids.push_back(id);
+                }
+            }
+            i += 1;
+        }
+        if new_ids.len() == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &new_ids);
+        }
+    }
+
+    fn vested_amount(stream: &Stream, now: u64) -> i128 {
+        Self::vested_amount_at(stream, now)
+    }
+
+    /// Calculate early cancellation fee based on remaining amount
+    fn calculate_early_cancel_fee(env: &Env, remaining_amount: i128) -> i128 {
+        let fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EarlyCancelFeeBps)
+            .unwrap_or(0); // Default to 0 if not set
+
+        if fee_bps == 0 || remaining_amount <= 0 {
+            return 0;
+        }
+
+        remaining_amount
+            .checked_mul(fee_bps as i128)
+            .unwrap_or(0)
+            .checked_div(10000) // Convert basis points to actual amount
+            .unwrap_or(0)
+    }
+
+    /// Invoke `payout_liability` on the vault contract.
+    pub(crate) fn call_vault_payout(
+        env: &Env,
+        vault: &Address,
+        worker: Address,
+        token: Address,
+        amount: i128,
+    ) {
+        use soroban_sdk::{IntoVal, Symbol, vec};
+        env.invoke_contract::<()>(
+            vault,
+            &Symbol::new(env, "payout_liability"),
+            vec![
+                env,
+                worker.into_val(env),
+                token.into_val(env),
+                amount.into_val(env),
+            ],
+        );
+    }
+
+    /// Invoke `remove_liability` on the vault contract.
+    pub(crate) fn call_vault_remove_liability(
+        env: &Env,
+        vault: &Address,
+        token: Address,
+        amount: i128,
+    ) {
+        use soroban_sdk::{IntoVal, Symbol, vec};
+        env.invoke_contract::<()>(
+            vault,
+            &Symbol::new(env, "remove_liability"),
+            vec![env, token.into_val(env), amount.into_val(env)],
+        );
+    }
+
+    /// If a PayrollReceipt contract is registered, mint a receipt for the closed stream.
+    /// Failures are silently ignored so they never block stream closure.
+    pub(crate) fn try_mint_receipt(
+        env: &Env,
+        stream: &Stream,
+        stream_id: u64,
+        reason: u32, // 0 = Completed, 1 = Cancelled
+    ) {
+        use soroban_sdk::{IntoVal, Symbol, vec};
+        let Some(receipt_addr): Option<Address> =
+            env.storage().instance().get(&DataKey::Receipt)
+        else {
+            return;
+        };
+        // ClosureReason enum discriminant is passed as u32 to avoid a cross-crate
+        // contracttype dependency at the call site.
+        let _ = env.try_invoke_contract::<u64, ()>(
+            &receipt_addr,
+            &Symbol::new(env, "mint"),
+            vec![
+                env,
+                stream_id.into_val(env),
+                stream.employer.clone().into_val(env),
+                stream.worker.clone().into_val(env),
+                stream.token.clone().into_val(env),
+                stream.withdrawn_amount.into_val(env),
+                stream.start_ts.into_val(env),
+                stream.end_ts.into_val(env),
+                stream.closed_at.into_val(env),
+                reason.into_val(env),
+            ],
+        );
+    }
+
     pub(crate) fn vested_amount_at(stream: &Stream, timestamp: u64) -> i128 {
         let is_closed = Self::is_closed(stream);
         let mut effective_ts = if is_closed {

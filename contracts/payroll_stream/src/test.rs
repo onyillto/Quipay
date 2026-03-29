@@ -2459,7 +2459,7 @@ fn test_pause_and_cancel_interaction() {
     // Remaining liability (refund to employer): 10000 - 2000 = 8000
     // Fee: 8000 * 500 / 10000 = 400
     // Note: In finalize_cancel, the vault payouts for 'owed' and 'cancel_fee'
-    // and the removal of 'remaining_liability' are all executed.
+    // and the removal of 'remaining_liability' are all executed. The fee is sent to the fee_recipient.
 }
 #[test]
 fn test_transfer_stream_success() {
