@@ -28,7 +28,6 @@ const circuitBreakerFailures = new Counter({
   help: "Total number of circuit breaker failures",
   labelNames: ["name", "error"],
 });
-
 const circuitBreakerSuccesses = new Counter({
   name: "circuit_breaker_successes_total",
   help: "Total number of circuit breaker successes",
