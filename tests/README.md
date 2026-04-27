@@ -53,6 +53,14 @@ npm run test:e2e:debug
 npm run test:e2e:report
 ```
 
+### Contract Testing (Schemathesis)
+
+Ensures the API implementation matches the OpenAPI specification. Run this against a locally running backend.
+
+```bash
+npm run test:contract
+```
+
 ## Test Coverage
 
 ### Stream Creation Flow (`stream-creation.spec.ts`)

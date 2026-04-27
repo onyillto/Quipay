@@ -1401,7 +1401,10 @@ const swaggerDefinition = {
  * Validates the generated spec for basic OpenAPI compliance.
  */
 export const validateSpec = () => {
-  if (!swaggerDefinition.paths || Object.keys(swaggerDefinition.paths).length === 0) {
+  if (
+    !swaggerDefinition.paths ||
+    Object.keys(swaggerDefinition.paths).length === 0
+  ) {
     throw new Error("OpenAPI spec is empty or has no paths defined.");
   }
 };
@@ -1414,6 +1417,9 @@ const options: swaggerJsdoc.Options = {
 };
 
 export const swaggerSpec = swaggerJsdoc(options);
+
+// Validate spec on initialization to catch obvious documentation errors at startup
+validateSpec();
 
 // Build Express router that serves the Swagger UI at /docs
 const docsRouter: Router = express.Router();
