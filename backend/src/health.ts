@@ -5,6 +5,14 @@ import { nonceManager } from "./index";
 
 export type DependencyState = "healthy" | "unhealthy";
 
+interface DatabasePool {
+  query(text: string): Promise<any>;
+  totalCount: number;
+  idleCount: number;
+  waitingCount: number;
+  options?: { max?: number };
+}
+
 export interface DependencyHealth {
   status: DependencyState;
   latencyMs: number;
@@ -62,33 +70,31 @@ async function checkDatabase(): Promise<DependencyHealth> {
   }
 
   try {
-    await withTimeout(pool.query("SELECT 1"), CHECK_TIMEOUT_MS);
-    const total = pool.totalCount;
-    const idle = pool.idleCount;
-    const waiting = pool.waitingCount;
-    const max = (pool as any).options?.max as number | undefined;
+    const dbPool = pool as unknown as DatabasePool;
+    await withTimeout(dbPool.query("SELECT 1"), CHECK_TIMEOUT_MS);
+    const total = dbPool.totalCount;
+    const idle = dbPool.idleCount;
+    const waiting = dbPool.waitingCount;
+    const max = dbPool.options?.max;
 
     return {
       status: "healthy",
       latencyMs: Date.now() - startedAt,
-      details: `pool(total=${total}, idle=${idle}, waiting=${waiting}, max=${max ?? "unknown"
-        })`,
+      details: `pool(total=${total}, idle=${idle}, waiting=${waiting}, max=${max ?? "unknown"})`,
     };
   } catch (error) {
-    const total = pool.totalCount;
-    const idle = pool.idleCount;
-    const waiting = pool.waitingCount;
-    const max = (pool as any).options?.max as number | undefined;
+    const dbPool = pool as unknown as DatabasePool;
+    const total = dbPool.totalCount;
+    const idle = dbPool.idleCount;
+    const waiting = dbPool.waitingCount;
+    const max = dbPool.options?.max;
 
     return {
       status: "unhealthy",
       latencyMs: Date.now() - startedAt,
-      details:
-        error instanceof Error
-          ? `${error.message}; pool(total=${total}, idle=${idle}, waiting=${waiting}, max=${max ?? "unknown"
-          })`
-          : `Database query failed; pool(total=${total}, idle=${idle}, waiting=${waiting}, max=${max ?? "unknown"
-          })`,
+      details: `Database query failed: ${
+        error instanceof Error ? error.message : String(error)
+      }; pool(total=${total}, idle=${idle}, waiting=${waiting}, max=${max ?? "unknown"})`,
     };
   }
 }
@@ -208,7 +214,8 @@ async function checkNonceManager(): Promise<DependencyHealth> {
     return {
       status: "unhealthy",
       latencyMs: Date.now() - startedAt,
-      details: error instanceof Error ? error.message : "Nonce manager check failed",
+      details:
+        error instanceof Error ? error.message : "Nonce manager check failed",
     };
   }
 }

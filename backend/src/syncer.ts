@@ -29,7 +29,10 @@ let inFlightSyncCycle: Promise<number> | null = null;
 
 // ─── Event parsers ────────────────────────────────────────────────────────────
 
-type StreamEventKind = "stream_created" | "stream_cancelled" | "funds_withdrawn";
+type StreamEventKind =
+  | "stream_created"
+  | "stream_cancelled"
+  | "funds_withdrawn";
 
 interface SyncedStreamEvent {
   kind: StreamEventKind;
@@ -52,9 +55,12 @@ const decodeScVal = (value: unknown): xdr.ScVal | null => {
       value &&
       typeof value === "object" &&
       "toXDR" in value &&
-      typeof (value as any).toXDR === "function"
+      typeof (value as { toXDR: Function }).toXDR === "function"
     ) {
-      return xdr.ScVal.fromXDR(toBase64Xdr(value as any), "base64");
+      return xdr.ScVal.fromXDR(
+        toBase64Xdr(value as { toXDR: (f: string) => string }),
+        "base64",
+      );
     }
 
     if (typeof value === "string" && value.length > 0) {
@@ -138,7 +144,9 @@ const asNumber = (value: unknown): number | null => {
   return null;
 };
 
-const decodeStreamEvent = (event: rpc.Api.EventResponse): SyncedStreamEvent | null => {
+const decodeStreamEvent = (
+  event: rpc.Api.EventResponse,
+): SyncedStreamEvent | null => {
   const topics = event.topic as unknown[];
   if (!topics || topics.length < 2) return null;
 
