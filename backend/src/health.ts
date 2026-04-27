@@ -60,11 +60,12 @@ async function checkDatabase(): Promise<DependencyHealth> {
   }
 
   try {
-    await withTimeout(pool.query("SELECT 1"), CHECK_TIMEOUT_MS);
-    const total = pool.totalCount;
-    const idle = pool.idleCount;
-    const waiting = pool.waitingCount;
-    const max = (pool as any).options?.max as number | undefined;
+    const dbPool = pool as unknown as DatabasePool;
+    await withTimeout(dbPool.query("SELECT 1"), CHECK_TIMEOUT_MS);
+    const total = dbPool.totalCount;
+    const idle = dbPool.idleCount;
+    const waiting = dbPool.waitingCount;
+    const max = dbPool.options?.max;
 
     return {
       status: "healthy",
@@ -74,22 +75,20 @@ async function checkDatabase(): Promise<DependencyHealth> {
       })`,
     };
   } catch (error) {
-    const total = pool.totalCount;
-    const idle = pool.idleCount;
-    const waiting = pool.waitingCount;
-    const max = (pool as any).options?.max as number | undefined;
+    const dbPool = pool as unknown as DatabasePool;
+    const total = dbPool.totalCount;
+    const idle = dbPool.idleCount;
+    const waiting = dbPool.waitingCount;
+    const max = dbPool.options?.max;
 
     return {
       status: "unhealthy",
       latencyMs: Date.now() - startedAt,
-      details:
-        error instanceof Error
-          ? `${error.message}; pool(total=${total}, idle=${idle}, waiting=${waiting}, max=${
-              max ?? "unknown"
-            })`
-          : `Database query failed; pool(total=${total}, idle=${idle}, waiting=${waiting}, max=${
-              max ?? "unknown"
-            })`,
+      details: `Database query failed: ${
+        error instanceof Error ? error.message : String(error)
+      }; pool(total=${total}, idle=${idle}, waiting=${waiting}, max=${
+        max ?? "unknown"
+      })`,
     };
   }
 }
